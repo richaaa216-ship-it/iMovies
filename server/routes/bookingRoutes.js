@@ -1,0 +1,32 @@
+const express = require('express');
+const router = express.Router();
+const {
+  lockSeats,
+  createBooking,
+  confirmPayment,
+  cancelBooking,
+  getUserBookings,
+  getAllBookings,
+  getPublicTicket
+} = require('../controllers/bookingController');
+const fetchUser = require('../middlewares/fetchUser');
+const fetchAdmin = require('../middlewares/fetchAdmin');
+
+// Public sharable ticket endpoints (unauthenticated)
+router.get('/public/:bookingId', getPublicTicket);
+router.get('/ticket/:bookingId', getPublicTicket);
+
+// Seat locking & Direct confirmed booking creation
+router.post('/lock', fetchUser, lockSeats);
+router.post('/', fetchUser, createBooking);
+router.post('/create', fetchUser, createBooking);
+
+// Payment confirmation & Cancellation
+router.put('/confirm/:bookingId', fetchUser, confirmPayment);
+router.put('/cancel/:bookingId', fetchUser, cancelBooking);
+
+// User and Admin queries
+router.get('/my', fetchUser, getUserBookings);
+router.get('/all', fetchAdmin, getAllBookings);
+
+module.exports = router;

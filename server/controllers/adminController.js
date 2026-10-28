@@ -1,0 +1,435 @@
+const Movie = require('../models/movieModel');
+const Theatre = require('../models/theatreModel');
+const Show = require('../models/showModel');
+const User = require('../models/userModel');
+const Booking = require('../models/bookingModel');
+const Admin = require('../models/adminModel');
+const bcrypt = require('bcryptjs');
+
+/**
+ * Get dashboard aggregated metrics
+ * Returns total movies, theatres, shows, users, completed bookings count, and total revenue
+ */
+const getDashboardStats = async (req, res) => {
+  try {
+    const [movies, theatres, shows, users, bookings] = await Promise.all([
+      Movie.countDocuments(),
+      Theatre.countDocuments(),
+      Show.countDocuments(),
+      User.countDocuments(),
+      Booking.find({ paymentStatus: 'Completed' })
+    ]);
+
+    const totalRevenue = bookings.reduce((sum, b) => sum + (b.totalAmount || 0), 0);
+
+    const metrics = {
+      totalMovies: movies,
+      totalTheatres: theatres,
+      totalShows: shows,
+      totalUsers: users,
+      totalBookings: bookings.length,
+      totalRevenue
+    };
+
+    return res.status(200).json({
+      success: true,
+      ...metrics,
+      stats: metrics
+    });
+  } catch (error) {
+    console.error('Error in getDashboardStats:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch dashboard stats'
+    });
+  }
+};
+
+/**
+ * Get all registered users (excluding password hashes)
+ * Enriched with total bookings and total spent per user
+ */
+const getAllUsers = async (req, res) => {
+  try {
+    const users = await User.find({}).select('-password').sort({ createdAt: -1 });
+
+    // Aggregate booking counts and revenue per user email
+    const userEmails = users.map((u) => (u.email || '').toLowerCase()).filter(Boolean);
+    const bookingsCountMap = {};
+
+    const bookingAgg = await Booking.aggregate([
+      { $match: { userEmail: { $in: userEmails } } },
+      {
+        $group: {
+          _id: { $toLower: '$userEmail' },
+          count: { $sum: 1 },
+          totalSpent: { $sum: '$totalAmount' }
+        }
+      }
+    ]);
+
+    bookingAgg.forEach((item) => {
+      bookingsCountMap[item._id] = {
+        count: item.count,
+        totalSpent: item.totalSpent
+      };
+    });
+
+    const enrichedUsers = users.map((u) => {
+      const emailKey = (u.email || '').toLowerCase();
+      const stats = bookingsCountMap[emailKey] || { count: 0, totalSpent: 0 };
+      return {
+        _id: u._id,
+        id: u._id,
+        username: u.username,
+        email: u.email,
+        role: u.role || 'user',
+        isVerified: u.isVerified,
+        createdAt: u.createdAt,
+        totalBookings: stats.count,
+        totalSpent: stats.totalSpent
+      };
+    });
+
+    return res.status(200).json({
+      success: true,
+      count: enrichedUsers.length,
+      users: enrichedUsers
+    });
+  } catch (error) {
+    console.error('Error in getAllUsers:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch users'
+    });
+  }
+};
+
+/**
+ * Delete a user by _id or userId
+ * Enforces admin authorization, protects administrative accounts and self-deletion
+ */
+const deleteUser = async (req, res) => {
+  try {
+    const targetId = req.params.userId || req.params.id;
+
+    if (!targetId) {
+      return res.status(400).json({
+        success: false,
+        error: 'User ID is required'
+      });
+    }
+
+    const user = await User.findById(targetId);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found'
+      });
+    }
+
+    // Security check: Prevent deleting admin role accounts via user endpoint
+    if (user.role === 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Action denied: Administrator accounts cannot be deleted via the user management panel.'
+      });
+    }
+
+    // Security check: Prevent self-deletion if current admin matches user id
+    if (req.user && req.user.id && req.user.id.toString() === targetId.toString()) {
+      return res.status(403).json({
+        success: false,
+        error: 'Action denied: You cannot delete your currently active administrative account.'
+      });
+    }
+
+    await User.findByIdAndDelete(targetId);
+
+    return res.status(200).json({
+      success: true,
+      message: `User account (${user.email}) deleted successfully`,
+      user: {
+        id: user._id,
+        email: user.email,
+        username: user.username
+      }
+    });
+  } catch (error) {
+    console.error('Error in deleteUser:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to delete user'
+    });
+  }
+};
+
+const mongoose = require('mongoose');
+const { v4: uuidv4 } = require('uuid');
+const Transaction = require('../models/transactionModel');
+const { sendBookingStatusUpdateEmail } = require('../services/emailService');
+
+const getIO = (req) => {
+  return req.app.get('io') || global.io || null;
+};
+
+/**
+ * Get all user transactions with aggregated summary
+ * GET /api/admin/transactions
+ */
+const getAllTransactions = async (req, res) => {
+  try {
+    const transactions = await Booking.find({}).sort({ createdAt: -1 });
+
+    const summary = {
+      totalTransactions: transactions.length,
+      totalCompletedRevenue: transactions
+        .filter((t) => t.paymentStatus === 'Completed')
+        .reduce((sum, t) => sum + (Number(t.totalAmount) || 0), 0),
+      totalRefundedAmount: transactions
+        .filter((t) => t.paymentStatus === 'Refunded')
+        .reduce((sum, t) => sum + (Number(t.refundAmount) || Number(t.totalAmount) || 0), 0),
+      completedCount: transactions.filter((t) => t.paymentStatus === 'Completed').length,
+      pendingCount: transactions.filter((t) => t.paymentStatus === 'Pending').length,
+      cancelledCount: transactions.filter((t) => t.paymentStatus === 'Cancelled').length,
+      refundedCount: transactions.filter((t) => t.paymentStatus === 'Refunded').length
+    };
+
+    return res.status(200).json({
+      success: true,
+      summary,
+      transactions
+    });
+  } catch (error) {
+    console.error('Error in getAllTransactions:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to fetch transactions'
+    });
+  }
+};
+
+/**
+ * Process direct refund and free up booked seats in MongoDB
+ * POST /api/admin/refund/:paymentId
+ */
+const refundBooking = async (req, res) => {
+  try {
+    const { paymentId } = req.params;
+    const { amount, reason = 'Admin initiated direct refund' } = req.body;
+
+    if (!paymentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Payment ID or Booking ID is required'
+      });
+    }
+
+    // Locate booking by transactionId, razorpayPaymentId, bookingId, or _id
+    const query = [
+      { transactionId: paymentId },
+      { razorpayPaymentId: paymentId },
+      { bookingId: paymentId }
+    ];
+    if (mongoose.Types.ObjectId.isValid(paymentId)) {
+      query.push({ _id: paymentId });
+    }
+
+    const booking = await Booking.findOne({ $or: query });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        error: `No booking found associated with ID: ${paymentId}`
+      });
+    }
+
+    if (booking.paymentStatus === 'Refunded') {
+      return res.status(400).json({
+        success: false,
+        error: 'This booking has already been refunded',
+        booking
+      });
+    }
+
+    const refundAmount = amount ? Number(amount) : Number(booking.totalAmount || 0);
+    const refundId = `rfnd_${uuidv4().replace(/-/g, '').slice(0, 16)}`;
+
+    // Update local booking status to 'Refunded'
+    booking.paymentStatus = 'Refunded';
+    booking.refundId = refundId;
+    booking.refundAmount = refundAmount;
+    booking.refundStatus = 'processed';
+    const updatedBooking = await booking.save();
+
+    // Also update transaction status if exists
+    try {
+      await Transaction.findOneAndUpdate(
+        { $or: [{ bookingId: booking.bookingId }, { transactionId: booking.transactionId }] },
+        { paymentStatus: 'Refunded' }
+      );
+    } catch (txnErr) {
+      console.warn('[Transaction Refund Status Note]:', txnErr.message);
+    }
+
+    // Free up the booked seats on the associated Show document
+    if (booking.showId && Array.isArray(booking.selectedSeats) && booking.selectedSeats.length > 0) {
+      const show = await Show.findOne({ showId: booking.showId });
+      if (show && show.tickets) {
+        for (const seatId of booking.selectedSeats) {
+          if (show.tickets[seatId]) {
+            show.tickets[seatId] = {
+              ...show.tickets[seatId],
+              status: 'available'
+            };
+            delete show.tickets[seatId].bookedBy;
+            delete show.tickets[seatId].lockedBy;
+            delete show.tickets[seatId].lockExpiry;
+          }
+        }
+        show.markModified('tickets');
+        await show.save();
+
+        // Broadcast real-time seat liberation
+        const io = getIO(req);
+        if (io) {
+          io.to(show.showId).emit('seats:released', {
+            showId: show.showId,
+            releasedSeats: booking.selectedSeats,
+            tickets: show.tickets
+          });
+          io.emit('show:updated', {
+            showId: show.showId,
+            tickets: show.tickets
+          });
+        }
+      }
+    }
+
+    // Dispatch refund notification email asynchronously via Brevo
+    if (booking.userEmail) {
+      sendBookingStatusUpdateEmail(booking.userEmail, {
+        bookingId: booking.bookingId,
+        movieName: booking.movieName,
+        status: 'Refunded',
+        refundAmount,
+        reason,
+        releasedSeats: booking.selectedSeats
+      }).catch((e) => console.warn('[adminController] Refund status email note:', e.message));
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: `Booking successfully refunded. ₹${refundAmount} has been credited and ${booking.selectedSeats.length} seats released.`,
+      refund: {
+        refundId,
+        amount: refundAmount,
+        status: booking.refundStatus,
+        method: 'Direct Refund'
+      },
+      booking: updatedBooking
+    });
+  } catch (error) {
+    console.error('Error in refundBooking:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to process refund'
+    });
+  }
+};
+
+/**
+ * Securely create/provision a new admin account from behind the admin panel
+ * POST /api/admin/create-admin
+ * Strictly protected by fetchAdmin
+ */
+const createAdminAccount = async (req, res) => {
+  try {
+    // Explicit RBAC verification
+    if (!req.admin || req.admin.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Access forbidden. Administrator privileges required.'
+      });
+    }
+
+    const { username, email, password } = req.body;
+
+    if (!username || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please provide username, email, and password'
+      });
+    }
+
+    if (username.trim().length < 3) {
+      return res.status(400).json({
+        success: false,
+        error: 'Username must be at least 3 characters long'
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Password must be at least 6 characters long'
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedUsername = username.trim();
+
+    const existingAdmin = await Admin.findOne({
+      $or: [{ email: normalizedEmail }, { username: normalizedUsername }]
+    });
+
+    if (existingAdmin) {
+      return res.status(400).json({
+        success: false,
+        error: existingAdmin.email === normalizedEmail
+          ? 'Admin with this email already exists'
+          : 'Admin with this username already exists'
+      });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const newAdmin = new Admin({
+      username: normalizedUsername,
+      email: normalizedEmail,
+      password: hashedPassword,
+      role: 'admin'
+    });
+
+    const savedAdmin = await newAdmin.save();
+
+    return res.status(201).json({
+      success: true,
+      message: 'New admin account provisioned successfully',
+      admin: {
+        id: savedAdmin._id,
+        email: savedAdmin.email,
+        username: savedAdmin.username,
+        role: 'admin'
+      }
+    });
+  } catch (error) {
+    console.error('Error in createAdminAccount:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create admin account'
+    });
+  }
+};
+
+module.exports = {
+  getDashboardStats,
+  getAllUsers,
+  deleteUser,
+  getAllTransactions,
+  refundBooking,
+  createAdminAccount
+};
+
